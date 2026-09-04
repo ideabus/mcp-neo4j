@@ -41,34 +41,49 @@ async def _is_write_query(query: str, driver: AsyncDriver, database: str) -> boo
 
 def _serialize_plan(plan: Any) -> Optional[dict]:
     """
-    Recursively convert a neo4j.work.summary.Plan / ProfiledPlan into a plain
-    JSON-serializable dict. Handles both EXPLAIN plans (estimated rows only,
-    in `arguments`) and PROFILE plans (which additionally carry actual
-    `db_hits` / `rows` / page-cache stats as top-level attributes).
+    Normalize the raw plan/profile metadata the driver hands back via
+    `ResultSummary.plan` / `ResultSummary.profile`.
+
+    In this driver version these are already plain dicts straight off the
+    Bolt wire (`ResultSummary.plan: dict | None`) - NOT a `Plan`/`ProfiledPlan`
+    object with `.operator_type` etc. as older driver versions/docs suggest.
+    Raw keys are camelCase: `operatorType`, `identifiers`, `args`, `children`,
+    and, only for PROFILE, `dbHits`/`rows`/`pageCacheHits`/`pageCacheMisses`/
+    `pageCacheHitRatio`/`time`. We just rename to snake_case and recurse into
+    `children`; no other reconstruction is needed.
     """
     if plan is None:
         return None
+    if not isinstance(plan, dict):
+        # Defensive fallback in case a future driver version does wrap this
+        # in a real object again.
+        plan = {
+            "operatorType": getattr(plan, "operator_type", None),
+            "identifiers": getattr(plan, "identifiers", []),
+            "args": getattr(plan, "arguments", {}),
+            "children": getattr(plan, "children", []),
+        }
 
     node: dict[str, Any] = {
-        "operator_type": getattr(plan, "operator_type", None),
-        "identifiers": list(getattr(plan, "identifiers", []) or []),
-        "arguments": dict(getattr(plan, "arguments", {}) or {}),
+        "operator_type": plan.get("operatorType"),
+        "identifiers": list(plan.get("identifiers") or []),
+        "arguments": dict(plan.get("args") or {}),
     }
 
-    # Only present on ProfiledPlan (i.e. when the query was run with PROFILE,
-    # not EXPLAIN) - these are actual runtime numbers, not estimates.
-    if hasattr(plan, "db_hits"):
-        node["db_hits"] = plan.db_hits
-    if hasattr(plan, "rows"):
-        node["rows"] = plan.rows
-    if getattr(plan, "has_page_cache_stats", False):
-        node["page_cache_hits"] = getattr(plan, "page_cache_hits", None)
-        node["page_cache_misses"] = getattr(plan, "page_cache_misses", None)
-        node["page_cache_hit_ratio"] = getattr(plan, "page_cache_hit_ratio", None)
-    if hasattr(plan, "time"):
-        node["time"] = plan.time
+    # Only present when the query was run with PROFILE, not EXPLAIN - these
+    # are actual runtime numbers, not estimates.
+    for raw_key, out_key in (
+        ("dbHits", "db_hits"),
+        ("rows", "rows"),
+        ("pageCacheHits", "page_cache_hits"),
+        ("pageCacheMisses", "page_cache_misses"),
+        ("pageCacheHitRatio", "page_cache_hit_ratio"),
+        ("time", "time"),
+    ):
+        if raw_key in plan:
+            node[out_key] = plan[raw_key]
 
-    children = getattr(plan, "children", None) or []
+    children = plan.get("children") or []
     if children:
         node["children"] = [_serialize_plan(c) for c in children]
 
