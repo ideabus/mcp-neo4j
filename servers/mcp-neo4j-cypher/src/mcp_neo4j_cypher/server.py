@@ -39,6 +39,42 @@ async def _is_write_query(query: str, driver: AsyncDriver, database: str) -> boo
     return "w" in (summary.query_type or "")
 
 
+def _serialize_plan(plan: Any) -> Optional[dict]:
+    """
+    Recursively convert a neo4j.work.summary.Plan / ProfiledPlan into a plain
+    JSON-serializable dict. Handles both EXPLAIN plans (estimated rows only,
+    in `arguments`) and PROFILE plans (which additionally carry actual
+    `db_hits` / `rows` / page-cache stats as top-level attributes).
+    """
+    if plan is None:
+        return None
+
+    node: dict[str, Any] = {
+        "operator_type": getattr(plan, "operator_type", None),
+        "identifiers": list(getattr(plan, "identifiers", []) or []),
+        "arguments": dict(getattr(plan, "arguments", {}) or {}),
+    }
+
+    # Only present on ProfiledPlan (i.e. when the query was run with PROFILE,
+    # not EXPLAIN) - these are actual runtime numbers, not estimates.
+    if hasattr(plan, "db_hits"):
+        node["db_hits"] = plan.db_hits
+    if hasattr(plan, "rows"):
+        node["rows"] = plan.rows
+    if getattr(plan, "has_page_cache_stats", False):
+        node["page_cache_hits"] = getattr(plan, "page_cache_hits", None)
+        node["page_cache_misses"] = getattr(plan, "page_cache_misses", None)
+        node["page_cache_hit_ratio"] = getattr(plan, "page_cache_hit_ratio", None)
+    if hasattr(plan, "time"):
+        node["time"] = plan.time
+
+    children = getattr(plan, "children", None) or []
+    if children:
+        node["children"] = [_serialize_plan(c) for c in children]
+
+    return node
+
+
 def create_mcp_server(
     neo4j_driver: AsyncDriver,
     database: str = "neo4j",
@@ -222,6 +258,115 @@ def create_mcp_server(
 
         except Exception as e:
             logger.error(f"Error executing read query: {e}\n{query}\n{params}")
+            raise ToolError(f"Error: {e}\n{query}\n{params}")
+
+    @mcp.tool(
+        name=namespace_prefix + "explain_neo4j_cypher",
+        annotations=ToolAnnotations(
+            title="Explain Neo4j Cypher",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def explain_neo4j_cypher(
+        query: str = Field(..., description="The Cypher query to explain. Do not prefix it with EXPLAIN yourself."),
+        params: dict[str, Any] = Field(
+            dict(), description="The parameters referenced by the Cypher query."
+        ),
+    ) -> list[ToolResult]:
+        """
+        Run EXPLAIN on a Cypher query and return the estimated query plan as JSON,
+        without executing the query. Safe to call on both read and write queries -
+        EXPLAIN never touches data.
+
+        Use this to check whether a query will hit an index or fall back to a full
+        label/relationship scan (look for `NodeByLabelScan` / `AllNodesScan` /
+        `Expand(All)` operators with a large `EstimatedRows`) before running it for real.
+        """
+        try:
+            _, summary, _ = await neo4j_driver.execute_query(
+                "EXPLAIN " + query,
+                parameters_=params,
+                database_=database,
+            )
+
+            plan_json = _serialize_plan(summary.plan)
+            result = {
+                "query_type": summary.query_type,
+                "plan": plan_json,
+            }
+            result_str = json.dumps(_value_sanitize(result), default=str)
+            if token_limit:
+                result_str = _truncate_string_to_tokens(result_str, token_limit)
+
+            return ToolResult(content=[TextContent(type="text", text=result_str)])
+
+        except Neo4jError as e:
+            logger.error(f"Neo4j Error explaining query: {e}\n{query}\n{params}")
+            raise ToolError(f"Neo4j Error: {e}\n{query}\n{params}")
+
+        except Exception as e:
+            logger.error(f"Error explaining query: {e}\n{query}\n{params}")
+            raise ToolError(f"Error: {e}\n{query}\n{params}")
+
+    @mcp.tool(
+        name=namespace_prefix + "profile_neo4j_cypher",
+        annotations=ToolAnnotations(
+            title="Profile Neo4j Cypher",
+            readOnlyHint=not allow_writes,
+            destructiveHint=allow_writes,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def profile_neo4j_cypher(
+        query: str = Field(..., description="The Cypher query to profile. Do not prefix it with PROFILE yourself."),
+        params: dict[str, Any] = Field(
+            dict(), description="The parameters referenced by the Cypher query."
+        ),
+    ) -> list[ToolResult]:
+        """
+        Run PROFILE on a Cypher query and return the actual query plan as JSON,
+        including real db_hits and rows per operator (not just estimates).
+
+        Unlike EXPLAIN, PROFILE actually executes the query. If this server is
+        running in read-only mode, write queries are rejected here exactly like
+        in `write_neo4j_cypher`.
+        """
+        is_write = await _is_write_query(query, neo4j_driver, database)
+        if not allow_writes and is_write:
+            raise ToolError(
+                "This server is read-only. Only MATCH queries may be profiled."
+            )
+
+        try:
+            _, summary, _ = await neo4j_driver.execute_query(
+                "PROFILE " + query,
+                parameters_=params,
+                routing_control=RoutingControl.WRITE if is_write else RoutingControl.READ,
+                database_=database,
+            )
+
+            plan_json = _serialize_plan(summary.profile)
+            result = {
+                "query_type": summary.query_type,
+                "counters": summary.counters.__dict__ if summary.counters else None,
+                "profile": plan_json,
+            }
+            result_str = json.dumps(_value_sanitize(result), default=str)
+            if token_limit:
+                result_str = _truncate_string_to_tokens(result_str, token_limit)
+
+            return ToolResult(content=[TextContent(type="text", text=result_str)])
+
+        except Neo4jError as e:
+            logger.error(f"Neo4j Error profiling query: {e}\n{query}\n{params}")
+            raise ToolError(f"Neo4j Error: {e}\n{query}\n{params}")
+
+        except Exception as e:
+            logger.error(f"Error profiling query: {e}\n{query}\n{params}")
             raise ToolError(f"Error: {e}\n{query}\n{params}")
 
     @mcp.tool(
